@@ -344,10 +344,10 @@ with st.sidebar:
         key="ui_api_key",
     )
     st.selectbox(
-        "Model Gemini",
-        ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
-        key="ui_model_name",
-    )
+    "Model Gemini",
+    ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.0-flash"],
+    key="ui_model_name",
+)
     default_psc = st.text_input("PSC Code", value="A095")
     st.success(f"Master Tunggal Aktif:\n- {len(df_nm):,} Noun-Modifier\n- {len(df_ms):,} Baris Atribut")
 

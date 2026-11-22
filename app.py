@@ -7,13 +7,20 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import openpyxl
 import streamlit as st
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
 st.set_page_config(page_title="SKK Migas Auto-Cataloging System", layout="wide")
 
 MS_FILE = "Material_Standard_26112014119179.xlsx"
+
+# --- 0. Pembaca Secrets yang Aman (Tidak Error Jika Secrets Kosong) ---
+def get_secret_safe(key: str, default: str = "") -> str:
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, default)
 
 # --- 1. Pembaca Master Excel Tunggal SKK Migas ---
 def read_skk_xlsx(filepath: str) -> pd.DataFrame:
@@ -61,7 +68,7 @@ def load_master_data():
     )
     return df_nm, df_ms
 
-# --- 2. Pencocokan Langsung ke Tabel Master (Lapisan 1 - Deterministik) ---
+# --- 2. Pencocokan Langsung ke Tabel Master (Lapisan 1 - Tanpa API Key) ---
 ALIAS_RULES = [
     (r"\bCROSS\s*OVER\b", ("CROSS-OVER", "--", "Cocok aturan master CROSS-OVER")),
     (r"\bCENTRALI[SZ]ER\b.*\bTUBING\b", ("CENTRALIZER", "TUBING", "Cocok master CENTRALIZER | TUBING")),
@@ -82,26 +89,21 @@ def match_from_master_direct(short_desc: str, long_desc: str, df_nm: pd.DataFram
     combined = f"{short_desc} , {long_desc}".upper()
     valid_pairs = set(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
 
-    # 1. Cek aturan alias/singkatan khusus migas
     for pattern, (n_target, m_target, note) in ALIAS_RULES:
         if re.search(pattern, combined) and (n_target, m_target) in valid_pairs:
             return n_target, m_target, 98, note
 
-    # 2. Pecah bagian awal Short Description berdasarkan koma (misal: "BEARING,BALL,6313C3...")
     parts = [p.strip() for p in short_desc.upper().split(",") if p.strip()]
     if not parts:
         return None
 
     first_token = parts[0]
-    # Cek apakah token pertama adalah NOUN yang ada di master
     noun_matches = df_nm[df_nm["NOUN"] == first_token]
     if not noun_matches.empty:
         mods = noun_matches["MODIFIER"].tolist()
-        # Cek apakah token kedua atau teks deskripsi mengandung salah satu MODIFIER resmi
         for mod in sorted(mods, key=len, reverse=True):
             if mod != "--" and re.search(rf"\b{re.escape(mod)}\b", combined):
                 return first_token, mod, 99, f"Cocok langsung master ({first_token} | {mod})"
-        # Jika Noun hanya punya 1 modifier resmi (misal FUSE -> '--'), langsung gunakan
         if len(mods) == 1:
             return first_token, mods[0], 95, f"Satu-satunya pasangan master untuk {first_token}"
 
@@ -140,14 +142,14 @@ class ExtractionResult(BaseModel):
 
 # --- 4. Fungsi Panggilan Gemini API ---
 def get_gemini_client():
-    api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+    api_key = st.session_state.get("ui_api_key", "").strip() or get_secret_safe("GEMINI_API_KEY", "")
     if not api_key:
-        st.error("GEMINI_API_KEY belum diatur di Streamlit Secrets!")
+        st.error("Silakan masukkan Gemini API Key di kotak pengaturan sebelah kiri (Sidebar) terlebih dahulu.")
         st.stop()
     return genai.Client(api_key=api_key)
 
 def get_model_name():
-    return st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+    return st.session_state.get("ui_model_name", "").strip() or get_secret_safe("GEMINI_MODEL", "gemini-2.5-flash")
 
 def filter_relevant_nm(texts: list[str], df_nm: pd.DataFrame) -> list[str]:
     nm_pairs = list(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
@@ -334,9 +336,19 @@ with st.sidebar:
         ],
     )
     st.divider()
-    st.header("Pengaturan Default")
-    default_psc = st.text_input("PSC Code", value=st.secrets.get("PSC_CODE", "A095"))
-    st.info(f"Model AI aktif: `{get_model_name()}`")
+    st.header("Konfigurasi API & PSC")
+    st.text_input(
+        "Gemini API Key",
+        type="password",
+        placeholder="Tempel AIzaSy... di sini",
+        key="ui_api_key",
+    )
+    st.selectbox(
+        "Model Gemini",
+        ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+        key="ui_model_name",
+    )
+    default_psc = st.text_input("PSC Code", value="A095")
     st.success(f"Master Tunggal Aktif:\n- {len(df_nm):,} Noun-Modifier\n- {len(df_ms):,} Baris Atribut")
 
 if menu_pilihan == "Menu 1: Analisa & Ekstrak Satuan":
@@ -456,7 +468,7 @@ elif menu_pilihan == "Menu 2: Batch Tahap 1 (Source_Data_Upload)":
             unmatched_rows = []
             valid_pairs = set(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
 
-            # Lapisan 1: Cocokkan langsung dengan master SKK Migas
+            # Lapisan 1: Pencocokan langsung dengan master SKK Migas (tidak butuh API key)
             for idx in range(total):
                 r = df_in.iloc[idx]
                 m_code = str(r[col_code]).strip()
@@ -486,61 +498,78 @@ elif menu_pilihan == "Menu 2: Batch Tahap 1 (Source_Data_Upload)":
 
             # Lapisan 2: Sisa item yang butuh analisis AI diproses per batch 10
             if unmatched_rows:
-                prog = st.progress(0)
-                status_txt = st.empty()
-                batch_size = 10
-                tot_ai = len(unmatched_rows)
-
-                for b_start in range(0, tot_ai, batch_size):
-                    b_end = min(b_start + batch_size, tot_ai)
-                    status_txt.text(f"AI menganalisis {b_start+1} s/d {b_end} dari {tot_ai} item tersisa...")
-                    chunk = unmatched_rows[b_start:b_end]
-
-                    try:
-                        decisions = classify_material_batch(chunk, df_nm)
-                    except Exception as e:
-                        st.error(f"Gagal memanggil Gemini API ({get_model_name()}): {e}")
-                        decisions = {}
-
-                    for item_in in chunk:
+                has_key = bool(st.session_state.get("ui_api_key", "").strip() or get_secret_safe("GEMINI_API_KEY", ""))
+                if not has_key:
+                    st.warning(f"{total - len(unmatched_rows)} item berhasil dicocokkan langsung ke master. Masukkan Gemini API Key di Sidebar untuk memproses {len(unmatched_rows)} item sisanya dengan AI.")
+                    for item_in in unmatched_rows:
                         idx = item_in["row_index"]
                         r = df_in.iloc[idx]
-                        m_code = str(r[col_code]).strip()
-                        s_desc = str(r[col_short]).strip()
-                        l_desc = str(r[col_long]).strip()
-                        uom_val = str(r[col_uom]).strip().upper() or "EA"
-
-                        dec = decisions.get(idx)
-                        if dec and (dec.noun.strip().upper(), dec.modifier.strip().upper()) in valid_pairs:
-                            noun_val = dec.noun.strip().upper()
-                            mod_val = dec.modifier.strip().upper()
-                            conf = dec.confidence
-                            note = dec.reason
-                        elif dec:
-                            matched_mods = df_nm[df_nm["NOUN"] == dec.noun.strip().upper()]["MODIFIER"].tolist()
-                            if matched_mods:
-                                noun_val = dec.noun.strip().upper()
-                                mod_val = matched_mods[0]
-                                conf = dec.confidence
-                                note = f"{dec.reason} (Modifier disesuaikan)"
-                            else:
-                                noun_val, mod_val, conf, note = "SPARE PARTS", "--", 50, "Perlu review manual"
-                        else:
-                            noun_val, mod_val, conf, note = "SPARE PARTS", "--", 0, "Cek model/API key"
-
                         results[idx] = {
-                            "PSC Material Code": m_code,
-                            "Noun": noun_val,
-                            "Modifier": mod_val,
-                            "Material - Short Description": s_desc,
-                            "Material - Long Description": l_desc,
-                            "Uom": uom_val,
-                            "Keyakinan AI (%)": conf,
-                            "Catatan AI": note,
+                            "PSC Material Code": str(r[col_code]).strip(),
+                            "Noun": "SPARE PARTS",
+                            "Modifier": "--",
+                            "Material - Short Description": str(r[col_short]).strip(),
+                            "Material - Long Description": str(r[col_long]).strip(),
+                            "Uom": str(r[col_uom]).strip().upper() or "EA",
+                            "Keyakinan AI (%)": 0,
+                            "Catatan AI": "Isi Gemini API Key di Sidebar untuk klasifikasi AI",
                         }
-                    prog.progress(b_end / tot_ai)
-                    time.sleep(0.2)
-                status_txt.success("Selesai memproses seluruh material!")
+                else:
+                    prog = st.progress(0)
+                    status_txt = st.empty()
+                    batch_size = 10
+                    tot_ai = len(unmatched_rows)
+
+                    for b_start in range(0, tot_ai, batch_size):
+                        b_end = min(b_start + batch_size, tot_ai)
+                        status_txt.text(f"AI menganalisis {b_start+1} s/d {b_end} dari {tot_ai} item tersisa...")
+                        chunk = unmatched_rows[b_start:b_end]
+
+                        try:
+                            decisions = classify_material_batch(chunk, df_nm)
+                        except Exception as e:
+                            st.error(f"Gagal memanggil Gemini API ({get_model_name()}): {e}")
+                            decisions = {}
+
+                        for item_in in chunk:
+                            idx = item_in["row_index"]
+                            r = df_in.iloc[idx]
+                            m_code = str(r[col_code]).strip()
+                            s_desc = str(r[col_short]).strip()
+                            l_desc = str(r[col_long]).strip()
+                            uom_val = str(r[col_uom]).strip().upper() or "EA"
+
+                            dec = decisions.get(idx)
+                            if dec and (dec.noun.strip().upper(), dec.modifier.strip().upper()) in valid_pairs:
+                                noun_val = dec.noun.strip().upper()
+                                mod_val = dec.modifier.strip().upper()
+                                conf = dec.confidence
+                                note = dec.reason
+                            elif dec:
+                                matched_mods = df_nm[df_nm["NOUN"] == dec.noun.strip().upper()]["MODIFIER"].tolist()
+                                if matched_mods:
+                                    noun_val = dec.noun.strip().upper()
+                                    mod_val = matched_mods[0]
+                                    conf = dec.confidence
+                                    note = f"{dec.reason} (Modifier disesuaikan)"
+                                else:
+                                    noun_val, mod_val, conf, note = "SPARE PARTS", "--", 50, "Perlu review manual"
+                            else:
+                                noun_val, mod_val, conf, note = "SPARE PARTS", "--", 0, "Cek API Key"
+
+                            results[idx] = {
+                                "PSC Material Code": m_code,
+                                "Noun": noun_val,
+                                "Modifier": mod_val,
+                                "Material - Short Description": s_desc,
+                                "Material - Long Description": l_desc,
+                                "Uom": uom_val,
+                                "Keyakinan AI (%)": conf,
+                                "Catatan AI": note,
+                            }
+                        prog.progress(b_end / tot_ai)
+                        time.sleep(0.2)
+                    status_txt.success("Selesai memproses seluruh material!")
 
             st.session_state.file1_records = results
 

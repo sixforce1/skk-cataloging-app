@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import time
 import zipfile
 import xml.etree.ElementTree as ET
@@ -14,6 +15,7 @@ st.set_page_config(page_title="SKK Migas Auto-Cataloging System", layout="wide")
 
 MS_FILE = "Material_Standard_26112014119179.xlsx"
 
+# --- 1. Pembaca Master Excel Tunggal SKK Migas ---
 def read_skk_xlsx(filepath: str) -> pd.DataFrame:
     try:
         df = pd.read_excel(filepath, dtype=str)
@@ -59,11 +61,58 @@ def load_master_data():
     )
     return df_nm, df_ms
 
+# --- 2. Pencocokan Langsung ke Tabel Master (Lapisan 1 - Deterministik) ---
+ALIAS_RULES = [
+    (r"\bCROSS\s*OVER\b", ("CROSS-OVER", "--", "Cocok aturan master CROSS-OVER")),
+    (r"\bCENTRALI[SZ]ER\b.*\bTUBING\b", ("CENTRALIZER", "TUBING", "Cocok master CENTRALIZER | TUBING")),
+    (r"\bCENTRALI[SZ]ER\b", ("CENTRALIZER", "CASING", "Cocok master CENTRALIZER | CASING")),
+    (r"\bRTD\b", ("DETECTOR", "RESISTANCE TEMPERATURE", "Singkatan RTD -> DETECTOR | RESISTANCE TEMPERATURE")),
+    (r"\bGASKET\b.*\b(SPW|SPIRAL\s*WOUND)\b", ("GASKET", "SPIRAL WOUND", "Cocok master GASKET | SPIRAL WOUND")),
+    (r"\bGASKET\b.*\bRING\s*JOINT\b", ("GASKET", "RING JOINT", "Cocok master GASKET | RING JOINT")),
+    (r"\bGAUGE\b.*\bPRESS", ("GAUGE", "PRESSURE", "Cocok master GAUGE | PRESSURE")),
+    (r"\bGAUGE\b.*\bTEMP", ("GAUGE", "TEMPERATURE", "Cocok master GAUGE | TEMPERATURE")),
+    (r"\bSAFETY\s*GOGGLES\b", ("GOGGLES", "SAFETY", "Cocok master GOGGLES | SAFETY")),
+    (r"\bCIRCUIT\s*BREAKER\b", ("BREAKER", "CIRCUIT", "Cocok master BREAKER | CIRCUIT")),
+    (r"\bLANDING\s*COLLARS?\b", ("COLLAR", "LANDING", "Cocok master COLLAR | LANDING")),
+    (r"\bCASING\b", ("CASING", "OCTG", "Cocok master CASING | OCTG")),
+    (r"\bTUBING\b", ("TUBING", "OCTG", "Cocok master TUBING | OCTG")),
+]
+
+def match_from_master_direct(short_desc: str, long_desc: str, df_nm: pd.DataFrame):
+    combined = f"{short_desc} , {long_desc}".upper()
+    valid_pairs = set(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
+
+    # 1. Cek aturan alias/singkatan khusus migas
+    for pattern, (n_target, m_target, note) in ALIAS_RULES:
+        if re.search(pattern, combined) and (n_target, m_target) in valid_pairs:
+            return n_target, m_target, 98, note
+
+    # 2. Pecah bagian awal Short Description berdasarkan koma (misal: "BEARING,BALL,6313C3...")
+    parts = [p.strip() for p in short_desc.upper().split(",") if p.strip()]
+    if not parts:
+        return None
+
+    first_token = parts[0]
+    # Cek apakah token pertama adalah NOUN yang ada di master
+    noun_matches = df_nm[df_nm["NOUN"] == first_token]
+    if not noun_matches.empty:
+        mods = noun_matches["MODIFIER"].tolist()
+        # Cek apakah token kedua atau teks deskripsi mengandung salah satu MODIFIER resmi
+        for mod in sorted(mods, key=len, reverse=True):
+            if mod != "--" and re.search(rf"\b{re.escape(mod)}\b", combined):
+                return first_token, mod, 99, f"Cocok langsung master ({first_token} | {mod})"
+        # Jika Noun hanya punya 1 modifier resmi (misal FUSE -> '--'), langsung gunakan
+        if len(mods) == 1:
+            return first_token, mods[0], 95, f"Satu-satunya pasangan master untuk {first_token}"
+
+    return None
+
+# --- 3. Skema Output Terstruktur AI ---
 class CandidateNM(BaseModel):
-    noun: str = Field(description="NOUN persis dari daftar resmi SKK Migas")
-    modifier: str = Field(description="MODIFIER persis dari daftar resmi SKK Migas")
-    confidence: int = Field(description="Skor keyakinan 0-100")
-    reason: str = Field(description="Alasan singkat")
+    noun: str
+    modifier: str
+    confidence: int
+    reason: str
 
 class ClassificationResult(BaseModel):
     top_candidates: list[CandidateNM]
@@ -89,6 +138,7 @@ class ExtractionResult(BaseModel):
     short_description: str
     long_description: str
 
+# --- 4. Fungsi Panggilan Gemini API ---
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
     if not api_key:
@@ -97,7 +147,7 @@ def get_gemini_client():
     return genai.Client(api_key=api_key)
 
 def get_model_name():
-    return st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-4-hydrogen"))
+    return st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
 def filter_relevant_nm(texts: list[str], df_nm: pd.DataFrame) -> list[str]:
     nm_pairs = list(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
@@ -119,10 +169,7 @@ def classify_material(raw_text: str, df_nm: pd.DataFrame) -> ClassificationResul
     prompt = (
         "Anda adalah cataloguer senior SKK Migas.\n"
         "Tentukan 3 kandidat (NOUN | MODIFIER) paling tepat dan SPESIFIK dari DAFTAR RESMI.\n"
-        "PRIORITASKAN NOUN & MODIFIER SPESIFIK sesuai benda utama (BEARING -> BEARING | BALL/ROLLER; "
-        "TAPE -> TAPE | MASKING/ADHESIVE; FUSE -> FUSE | --; GASKET -> GASKET | FLAT/SPIRAL WOUND; "
-        "FILTER -> FILTER | AIR/OIL; SWITCH -> SWITCH | ROCKER; GAUGE -> GAUGE | PRESSURE; HELMET -> HELMET | SAFETY).\n"
-        "Jangan pilih 'SPARE PARTS | --' hanya karena ada merek (SKF, NORD, CAT, SOLAR).\n\n"
+        "Utamakan NOUN & MODIFIER spesifik sesuai benda utama; hindari 'SPARE PARTS | --' jika benda punya Noun standar.\n\n"
         f"DESKRIPSI:\n\"{raw_text}\"\n\n"
         f"DAFTAR RESMI:\n{chr(10).join(filtered)}"
     )
@@ -188,6 +235,7 @@ def extract_attributes(raw_text: str, noun: str, modifier: str, schema_df: pd.Da
     )
     return ExtractionResult.model_validate_json(response.text)
 
+# --- 5. Generator File 1 & File 2 ---
 def build_file1_buffer(df_rows: pd.DataFrame) -> io.BytesIO:
     wb = openpyxl.Workbook()
     ws1 = wb.active
@@ -265,6 +313,7 @@ def build_file2_buffer(items: list[dict], df_ms: pd.DataFrame) -> io.BytesIO:
     buf2.seek(0)
     return buf2
 
+# --- 6. Antarmuka Utama ---
 df_nm, df_ms = load_master_data()
 
 if "single_items" not in st.session_state:
@@ -287,6 +336,7 @@ with st.sidebar:
     st.divider()
     st.header("Pengaturan Default")
     default_psc = st.text_input("PSC Code", value=st.secrets.get("PSC_CODE", "A095"))
+    st.info(f"Model AI aktif: `{get_model_name()}`")
     st.success(f"Master Tunggal Aktif:\n- {len(df_nm):,} Noun-Modifier\n- {len(df_ms):,} Baris Atribut")
 
 if menu_pilihan == "Menu 1: Analisa & Ekstrak Satuan":
@@ -301,7 +351,7 @@ if menu_pilihan == "Menu 1: Analisa & Ekstrak Satuan":
         raw_desc = st.text_area("Deskripsi Material Mentah:", height=120)
 
         if st.button("Cari Rekomendasi Noun - Modifier", type="primary") and raw_desc.strip():
-            with st.spinner("AI sedang mencocokkan..."):
+            with st.spinner("Mencocokkan dengan master & AI..."):
                 st.session_state.last_class_m1 = classify_material(raw_desc, df_nm)
                 st.session_state.last_input_m1 = {
                     "psc_code": default_psc,
@@ -401,62 +451,23 @@ elif menu_pilihan == "Menu 2: Batch Tahap 1 (Source_Data_Upload)":
         col_uom = c_m4.selectbox("Kolom Uom", cols, index=min(3, len(cols)-1))
 
         if st.button("Proses Klasifikasi Massal Sekarang", type="primary"):
-            results = []
-            prog = st.progress(0)
-            status_txt = st.empty()
             total = len(df_in)
-            batch_size = 10
+            results = [None] * total
+            unmatched_rows = []
             valid_pairs = set(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
 
-            for start_idx in range(0, total, batch_size):
-                end_idx = min(start_idx + batch_size, total)
-                msg_batch = f"Memproses batch baris {start_idx+1} s/d {end_idx} dari {total}..."
-                status_txt.text(msg_batch)
+            # Lapisan 1: Cocokkan langsung dengan master SKK Migas
+            for idx in range(total):
+                r = df_in.iloc[idx]
+                m_code = str(r[col_code]).strip()
+                s_desc = str(r[col_short]).strip()
+                l_desc = str(r[col_long]).strip()
+                uom_val = str(r[col_uom]).strip().upper() or "EA"
 
-                batch_payload = []
-                for idx in range(start_idx, end_idx):
-                    r = df_in.iloc[idx]
-                    batch_payload.append({
-                        "row_index": idx,
-                        "short": str(r[col_short]).strip(),
-                        "long": str(r[col_long]).strip(),
-                    })
-
-                try:
-                    decisions = classify_material_batch(batch_payload, df_nm)
-                except Exception:
-                    time.sleep(1.5)
-                    try:
-                        decisions = classify_material_batch(batch_payload, df_nm)
-                    except Exception:
-                        decisions = {}
-
-                for idx in range(start_idx, end_idx):
-                    r = df_in.iloc[idx]
-                    m_code = str(r[col_code]).strip()
-                    s_desc = str(r[col_short]).strip()
-                    l_desc = str(r[col_long]).strip()
-                    uom_val = str(r[col_uom]).strip().upper() or "EA"
-
-                    dec = decisions.get(idx)
-                    if dec and (dec.noun.strip().upper(), dec.modifier.strip().upper()) in valid_pairs:
-                        noun_val = dec.noun.strip().upper()
-                        mod_val = dec.modifier.strip().upper()
-                        conf = dec.confidence
-                        note = dec.reason
-                    elif dec:
-                        matched_mods = df_nm[df_nm["NOUN"] == dec.noun.strip().upper()]["MODIFIER"].tolist()
-                        if matched_mods:
-                            noun_val = dec.noun.strip().upper()
-                            mod_val = matched_mods[0]
-                            conf = dec.confidence
-                            note = f"{dec.reason} (Modifier disesuaikan)"
-                        else:
-                            noun_val, mod_val, conf, note = "SPARE PARTS", "--", 50, "Perlu review manual"
-                    else:
-                        noun_val, mod_val, conf, note = "SPARE PARTS", "--", 0, "Gagal klasifikasi batch"
-
-                    results.append({
+                direct = match_from_master_direct(s_desc, l_desc, df_nm)
+                if direct:
+                    noun_val, mod_val, conf, note = direct
+                    results[idx] = {
                         "PSC Material Code": m_code,
                         "Noun": noun_val,
                         "Modifier": mod_val,
@@ -465,19 +476,79 @@ elif menu_pilihan == "Menu 2: Batch Tahap 1 (Source_Data_Upload)":
                         "Uom": uom_val,
                         "Keyakinan AI (%)": conf,
                         "Catatan AI": note,
+                    }
+                else:
+                    unmatched_rows.append({
+                        "row_index": idx,
+                        "short": s_desc,
+                        "long": l_desc,
                     })
 
-                prog.progress(end_idx / total)
-                time.sleep(0.3)
+            # Lapisan 2: Sisa item yang butuh analisis AI diproses per batch 10
+            if unmatched_rows:
+                prog = st.progress(0)
+                status_txt = st.empty()
+                batch_size = 10
+                tot_ai = len(unmatched_rows)
+
+                for b_start in range(0, tot_ai, batch_size):
+                    b_end = min(b_start + batch_size, tot_ai)
+                    status_txt.text(f"AI menganalisis {b_start+1} s/d {b_end} dari {tot_ai} item tersisa...")
+                    chunk = unmatched_rows[b_start:b_end]
+
+                    try:
+                        decisions = classify_material_batch(chunk, df_nm)
+                    except Exception as e:
+                        st.error(f"Gagal memanggil Gemini API ({get_model_name()}): {e}")
+                        decisions = {}
+
+                    for item_in in chunk:
+                        idx = item_in["row_index"]
+                        r = df_in.iloc[idx]
+                        m_code = str(r[col_code]).strip()
+                        s_desc = str(r[col_short]).strip()
+                        l_desc = str(r[col_long]).strip()
+                        uom_val = str(r[col_uom]).strip().upper() or "EA"
+
+                        dec = decisions.get(idx)
+                        if dec and (dec.noun.strip().upper(), dec.modifier.strip().upper()) in valid_pairs:
+                            noun_val = dec.noun.strip().upper()
+                            mod_val = dec.modifier.strip().upper()
+                            conf = dec.confidence
+                            note = dec.reason
+                        elif dec:
+                            matched_mods = df_nm[df_nm["NOUN"] == dec.noun.strip().upper()]["MODIFIER"].tolist()
+                            if matched_mods:
+                                noun_val = dec.noun.strip().upper()
+                                mod_val = matched_mods[0]
+                                conf = dec.confidence
+                                note = f"{dec.reason} (Modifier disesuaikan)"
+                            else:
+                                noun_val, mod_val, conf, note = "SPARE PARTS", "--", 50, "Perlu review manual"
+                        else:
+                            noun_val, mod_val, conf, note = "SPARE PARTS", "--", 0, "Cek model/API key"
+
+                        results[idx] = {
+                            "PSC Material Code": m_code,
+                            "Noun": noun_val,
+                            "Modifier": mod_val,
+                            "Material - Short Description": s_desc,
+                            "Material - Long Description": l_desc,
+                            "Uom": uom_val,
+                            "Keyakinan AI (%)": conf,
+                            "Catatan AI": note,
+                        }
+                    prog.progress(b_end / tot_ai)
+                    time.sleep(0.2)
+                status_txt.success("Selesai memproses seluruh material!")
 
             st.session_state.file1_records = results
-            status_txt.success(f"Selesai memproses {total} material!")
 
     if st.session_state.file1_records:
         df_res_preview = pd.DataFrame(st.session_state.file1_records)
         sp_count = (df_res_preview["Noun"] == "SPARE PARTS").sum()
-        spec_count = len(df_res_preview) - sp_count
-        st.info(f"Ringkasan: **{spec_count} item** mendapat Noun & Modifier spesifik, **{sp_count} item** masuk SPARE PARTS | --.")
+        mod_filled = (df_res_preview["Modifier"] != "--").sum()
+        st.info(f"Ringkasan: **{mod_filled} item** terisi Modifier spesifik, **{sp_count} item** masuk SPARE PARTS | --.")
 
         df_f1_edit = st.data_editor(df_res_preview, use_container_width=True, num_rows="dynamic", key="editor_f1_batch")
         buf_f1 = build_file1_buffer(df_f1_edit)
@@ -518,11 +589,7 @@ elif menu_pilihan == "Menu 3: Batch Tahap 2 (Data_Extraction_Upload)":
 
                 schema_df = df_ms[(df_ms["NOUN"] == noun_v) & (df_ms["MODIFIER"] == mod_v)].sort_values("SEQ")
                 if not schema_df.empty:
-                    try:
-                        ext = extract_attributes(long_v, noun_v, mod_v, schema_df)
-                    except Exception:
-                        time.sleep(1.0)
-                        ext = extract_attributes(long_v, noun_v, mod_v, schema_df)
+                    ext = extract_attributes(long_v, noun_v, mod_v, schema_df)
                     attr_map = {a.seq: a.value for a in ext.attributes}
                     std_long = ext.long_description
                     full_attrs = [

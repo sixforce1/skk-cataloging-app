@@ -12,13 +12,12 @@ from google.genai import types
 
 st.set_page_config(page_title="SKK Migas Auto-Cataloging System", layout="wide")
 
-NM_FILE = "Noun_Modifier_List_261120141113553.xlsx"
 MS_FILE = "Material_Standard_26112014119179.xlsx"
 
-# --- 1. Pembaca Master Excel SKK Migas ---
+# --- 1. Pembaca Master Excel Tunggal SKK Migas ---
 def read_skk_xlsx(filepath: str) -> pd.DataFrame:
     try:
-        df = pd.read_excel(filepath)
+        df = pd.read_excel(filepath, dtype=str)
         if not df.empty:
             return df
     except Exception:
@@ -45,18 +44,21 @@ def read_skk_xlsx(filepath: str) -> pd.DataFrame:
 
 @st.cache_data
 def load_master_data():
-    df_nm = read_skk_xlsx(NM_FILE)
-    df_nm.columns = [c.strip().upper() for c in df_nm.columns]
-    df_nm["NOUN"] = df_nm["NOUN"].astype(str).str.strip().str.upper()
-    df_nm["MODIFIER"] = df_nm["MODIFIER"].astype(str).str.strip().str.upper()
-
-    df_ms = read_skk_xlsx(MS_FILE)
+    df_ms = read_skk_xlsx(MS_FILE).fillna("")
     df_ms.columns = [c.strip().upper() for c in df_ms.columns]
     df_ms["NOUN"] = df_ms["NOUN"].astype(str).str.strip().str.upper()
     df_ms["MODIFIER"] = df_ms["MODIFIER"].astype(str).str.strip().str.upper()
-    df_ms["SEQ"] = df_ms["SEQ"].astype(int)
+    df_ms["SEQ"] = df_ms["SEQ"].astype(str).str.strip().astype(int)
     df_ms["MANDATORY"] = df_ms["MANDATORY"].astype(str).str.strip().str.upper()
     df_ms["ATTRIBUTE"] = df_ms["ATTRIBUTE"].astype(str).str.strip().str.upper()
+
+    # Ekstrak seluruh 1.114 pasangan unik NOUN & MODIFIER langsung dari Material_Standard
+    df_nm = (
+        df_ms[["NOUN", "MODIFIER"]]
+        .drop_duplicates()
+        .sort_values(["NOUN", "MODIFIER"])
+        .reset_index(drop=True)
+    )
     return df_nm, df_ms
 
 # --- 2. Skema Output Terstruktur AI ---
@@ -69,6 +71,16 @@ class CandidateNM(BaseModel):
 class ClassificationResult(BaseModel):
     top_candidates: list[CandidateNM] = Field(description="3 kandidat Noun-Modifier terbaik")
     needs_review: bool = Field(description="True jika ambigu atau skor tertinggi < 85")
+
+class BatchItemDecision(BaseModel):
+    row_index: int = Field(description="Nomor urut baris input yang diproses")
+    noun: str = Field(description="NOUN persis dari daftar resmi SKK Migas")
+    modifier: str = Field(description="MODIFIER persis dari daftar resmi SKK Migas")
+    confidence: int = Field(description="Skor keyakinan 0-100")
+    reason: str = Field(description="Alasan singkat pemilihan Noun & Modifier")
+
+class BatchClassificationResult(BaseModel):
+    items: list[BatchItemDecision]
 
 class ExtractedAttr(BaseModel):
     seq: int
@@ -91,19 +103,40 @@ def get_gemini_client():
 def get_model_name():
     return st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-4-hydrogen"))
 
+def filter_relevant_nm(texts: list[str], df_nm: pd.DataFrame) -> list[str]:
+    nm_pairs = list(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
+    tokens = set()
+    for t in texts:
+        cleaned = (
+            t.upper()
+            .replace(",", " ")
+            .replace(";", " ")
+            .replace("/", " ")
+            .replace("-", " ")
+        )
+        for w in cleaned.split():
+            w = w.strip("().:\"")
+            if len(w) >= 3:
+                tokens.add(w)
+    filtered = [f"{n} | {m}" for n, m in nm_pairs if any(tok in n or tok in m for tok in tokens)]
+    if "SPARE PARTS | --" not in filtered:
+        filtered.append("SPARE PARTS | --")
+    return filtered if len(filtered) >= 15 else [f"{n} | {m}" for n, m in nm_pairs]
+
 def classify_material(raw_text: str, df_nm: pd.DataFrame) -> ClassificationResult:
     client = get_gemini_client()
-    nm_pairs = list(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
-    words = {w.strip(",.;:-/()") for w in raw_text.upper().split() if len(w) > 2}
-    filtered = [f"{n} | {m}" for n, m in nm_pairs if any(w in n or w in m for w in words)]
-    if len(filtered) < 25:
-        filtered = [f"{n} | {m}" for n, m in nm_pairs]
+    filtered = filter_relevant_nm([raw_text], df_nm)
 
     prompt = (
-        "Anda adalah ahli katalogisasi material migas SKK Migas.\n"
-        "Tugas: Tentukan 3 kandidat (NOUN | MODIFIER) paling tepat dari DAFTAR RESMI di bawah untuk deskripsi material berikut.\n"
-        "Jika barang merupakan komponen spesifik mesin/OEM tanpa bentuk standar umum, sertakan 'SPARE PARTS | --' sebagai kandidat.\n"
-        "Jangan pernah mengarang NOUN atau MODIFIER di luar daftar resmi.\n\n"
+        "Anda adalah cataloguer senior SKK Migas.\n"
+        "Tentukan 3 kandidat (NOUN | MODIFIER) paling tepat dan SPESIFIK dari DAFTAR RESMI untuk material berikut.\n"
+        "ATURAN WAJIB:\n"
+        "1. PRIORITASKAN NOUN & MODIFIER SPESIFIK berdasarkan jenis barang utamanya (contoh: BEARING -> BEARING | BALL atau BEARING | ROLLER; "
+        "TAPE -> TAPE | MASKING atau TAPE | ELECTRICAL atau TAPE | ADHESIVE; FUSE -> FUSE | --; GASKET -> GASKET | SPIRAL WOUND atau GASKET | RING JOINT atau GASKET | FLAT; "
+        "FILTER -> FILTER | AIR atau FILTER | OIL; SWITCH -> SWITCH | ROCKER atau SWITCH | PRESSURE; GAUGE -> GAUGE | PRESSURE atau GAUGE | TEMPERATURE; HELMET -> HELMET | SAFETY).\n"
+        "2. Jangan memilih 'SPARE PARTS | --' hanya karena ada nama merek/mesin (seperti SKF, NORD, CAT, SOLAR). "
+        "Gunakan 'SPARE PARTS | --' HANYA sebagai pilihan terakhir jika jenis barangnya benar-benar tidak ada Noun standarnya di daftar resmi.\n"
+        "3. NOUN dan MODIFIER wajib persis sama dengan DAFTAR RESMI.\n\n"
         f"DESKRIPSI MATERIAL MENTAH:\n\"{raw_text}\"\n\n"
         f"DAFTAR RESMI (NOUN | MODIFIER):\n{chr(10).join(filtered)}"
     )
@@ -113,10 +146,44 @@ def classify_material(raw_text: str, df_nm: pd.DataFrame) -> ClassificationResul
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=ClassificationResult,
-            temperature=0.1,
+            temperature=0.05,
         ),
     )
     return ClassificationResult.model_validate_json(response.text)
+
+def classify_material_batch(batch_rows: list[dict], df_nm: pd.DataFrame) -> dict[int, BatchItemDecision]:
+    client = get_gemini_client()
+    texts = [f"{r['short']} {r['long']}" for r in batch_rows]
+    filtered = filter_relevant_nm(texts, df_nm)
+
+    items_block = "\n".join(
+        f"- row_index: {r['row_index']} | Short: \"{r['short']}\" | Long: \"{r['long']}\""
+        for r in batch_rows
+    )
+
+    prompt = (
+        "Anda adalah cataloguer senior SKK Migas.\n"
+        "Tugas: Klasifikasikan setiap item pada DAFTAR INPUT ke pasangan (NOUN | MODIFIER) paling spesifik dari DAFTAR RESMI.\n"
+        "ATURAN SANGAT PENTING:\n"
+        "1. Selalu utamakan NOUN dan MODIFIER spesifik sesuai benda utamanya (misalnya BEARING -> BEARING | BALL / ROLLER; "
+        "TAPE -> TAPE | MASKING / ADHESIVE / ELECTRICAL; FUSE -> FUSE | --; GASKET -> GASKET | FLAT / SPIRAL WOUND / RING JOINT; "
+        "FILTER -> FILTER | AIR / OIL / FUEL; SWITCH -> SWITCH | ROCKER / PRESSURE; GAUGE -> GAUGE | PRESSURE; HELMET -> HELMET | SAFETY; TUBING -> TUBING | ...).\n"
+        "2. DILARANG memilih 'SPARE PARTS | --' apabila benda tersebut memiliki Noun standar di daftar resmi, meskipun deskripsinya menyebut merek/unit mesin (SKF, NORD, CAT, SOLAR, dll).\n"
+        "3. Pastikan NOUN dan MODIFIER tertulis PERSIS seperti di DAFTAR RESMI.\n\n"
+        f"DAFTAR INPUT MATERIAL:\n{items_block}\n\n"
+        f"DAFTAR RESMI (NOUN | MODIFIER):\n{chr(10).join(filtered)}"
+    )
+    response = client.models.generate_content(
+        model=get_model_name(),
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=BatchClassificationResult,
+            temperature=0.05,
+        ),
+    )
+    parsed = BatchClassificationResult.model_validate_json(response.text)
+    return {item.row_index: item for item in parsed.items}
 
 def extract_attributes(raw_text: str, noun: str, modifier: str, schema_df: pd.DataFrame) -> ExtractionResult:
     client = get_gemini_client()
@@ -292,10 +359,15 @@ with st.sidebar:
     st.divider()
     st.header("Pengaturan Default")
     default_psc = st.text_input("PSC Code", value=st.secrets.get("PSC_CODE", "A095"))
-    st.success(f"Master SKK Migas aktif:\n- {len(df_nm):,} Noun-Modifier\n- {len(df_ms):,} Baris Atribut")
+    st.success(
+        f"Master Tunggal Aktif:\n"
+        f"- File: {MS_FILE}\n"
+        f"- {len(df_nm):,} Noun-Modifier\n"
+        f"- {len(df_ms):,} Baris Atribut"
+    )
 
 # ==============================================================================
-# MENU 1: ANALISA & EKSTRAK SATUAN (SEPERTI VERSI AWAL)
+# MENU 1: ANALISA & EKSTRAK SATUAN
 # ==============================================================================
 if menu_pilihan == "Menu 1: Analisa & Ekstrak Satuan":
     st.title("Menu 1: Analisa & Ekstrak Satuan")
@@ -332,7 +404,7 @@ if menu_pilihan == "Menu 1: Analisa & Ekstrak Satuan":
                 f"{c.noun} | {c.modifier}  —  (Keyakinan: {c.confidence}% | {c.reason})"
                 for c in res.top_candidates
             ]
-            options.append("Pilih Manual dari 1.114 Daftar Lengkap...")
+            options.append(f"Pilih Manual dari {len(df_nm):,} Daftar Lengkap...")
             choice = st.radio("Kandidat Klasifikasi:", options, key="rad_m1")
 
             if choice.startswith("Pilih Manual"):
@@ -432,7 +504,7 @@ if menu_pilihan == "Menu 1: Analisa & Ekstrak Satuan":
 # ==============================================================================
 elif menu_pilihan == "Menu 2: Batch Tahap 1 (Source_Data_Upload)":
     st.title("Menu 2: Batch Upload Tahap 1 (Source_Data_Upload)")
-    st.caption("Klasifikasi massal Noun & Modifier untuk upload tahap pertama ke e-Catalog SKK Migas (lengkap dengan 2 sheet template resmi).")
+    st.caption("Klasifikasi massal cepat (Batch 10 item per request) dengan prioritas Noun & Modifier spesifik dari master SKK Migas.")
 
     sample_df = pd.DataFrame([
         {
@@ -466,150 +538,9 @@ elif menu_pilihan == "Menu 2: Batch Tahap 1 (Source_Data_Upload)":
             prog = st.progress(0)
             status_txt = st.empty()
             total = len(df_in)
+            batch_size = 10
+            valid_pairs = set(zip(df_nm["NOUN"], df_nm["MODIFIER"]))
 
-            for idx, r in df_in.iterrows():
-                m_code = str(r[col_code]).strip()
-                s_desc = str(r[col_short]).strip()
-                l_desc = str(r[col_long]).strip()
-                uom_val = str(r[col_uom]).strip().upper() or "EA"
-                combined_text = f"{s_desc} | {l_desc}".strip(" |")
-
-                status_txt.text(f"Memproses {idx+1}/{total}: [{m_code}] {s_desc[:40]}...")
-                try:
-                    res = classify_material(combined_text, df_nm)
-                    top = res.top_candidates[0]
-                    noun_val, mod_val, conf, note = top.noun, top.modifier, top.confidence, top.reason
-                except Exception as e:
-                    noun_val, mod_val, conf, note = "SPARE PARTS", "--", 0, f"Error: {e}"
-
-                results.append({
-                    "PSC Material Code": m_code,
-                    "Noun": noun_val,
-                    "Modifier": mod_val,
-                    "Material - Short Description": s_desc,
-                    "Material - Long Description": l_desc,
-                    "Uom": uom_val,
-                    "Keyakinan AI (%)": conf,
-                    "Catatan AI": note,
-                })
-                prog.progress((idx + 1) / total)
-                time.sleep(0.2)
-
-            st.session_state.file1_records = results
-            status_txt.success(f"Selesai memproses {total} material!")
-
-    if st.session_state.file1_records:
-        st.subheader("Review & Edit Hasil Klasifikasi File 1")
-        df_f1_edit = st.data_editor(
-            pd.DataFrame(st.session_state.file1_records),
-            use_container_width=True,
-            num_rows="dynamic",
-            key="editor_f1_batch",
-        )
-        empty_codes = df_f1_edit["PSC Material Code"].astype(str).str.strip().eq("").sum()
-        if empty_codes > 0:
-            st.warning(f"Perhatian: Terdapat {empty_codes} baris yang kolom 'PSC Material Code'-nya masih kosong. Silakan isi di tabel atas sebelum mengunduh.")
-
-        buf_f1 = build_file1_buffer(df_f1_edit)
-        st.download_button(
-            label="Download File 1 Siap Upload e-Catalog SKK Migas (Source_Data_Upload.xlsx)",
-            data=buf_f1,
-            file_name="Source_Data_Upload.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
-
-# ==============================================================================
-# MENU 3: BATCH TAHAP 2 (DATA_EXTRACTION_UPLOAD)
-# ==============================================================================
-elif menu_pilihan == "Menu 3: Batch Tahap 2 (Data_Extraction_Upload)":
-    st.title("Menu 3: Batch Ekstraksi Tahap 2 (Data_Extraction_Upload)")
-    st.caption("Ekstraksi massal nilai atribut teknis untuk upload tahap kedua setelah memperoleh Ref.No dari e-Catalog SKK Migas.")
-
-    uploaded_f2_src = st.file_uploader("Upload Excel Daftar Material Tahap 2 (.xlsx)", type=["xlsx"], key="up_f2")
-    if uploaded_f2_src is not None:
-        df_in2 = pd.read_excel(uploaded_f2_src, dtype=str).fillna("")
-        st.dataframe(df_in2.head(5), use_container_width=True)
-        cols2 = df_in2.columns.tolist()
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        c2_code = k1.selectbox("PSC Material Code", cols2, index=0)
-        c2_ref = k2.selectbox("Ref.No", cols2, index=min(1, len(cols2)-1))
-        c2_noun = k3.selectbox("Noun", cols2, index=min(2, len(cols2)-1))
-        c2_mod = k4.selectbox("Modifier", cols2, index=min(3, len(cols2)-1))
-        c2_long = k5.selectbox("Long Description", cols2, index=min(4, len(cols2)-1))
-        c2_uom = k6.selectbox("Uom", cols2, index=min(5, len(cols2)-1))
-
-        if st.button("Ekstrak Atribut Massal untuk File 2", type="primary"):
-            extracted_list = []
-            prog2 = st.progress(0)
-            st_txt2 = st.empty()
-            tot2 = len(df_in2)
-
-            for idx, r in df_in2.iterrows():
-                noun_v = str(r[c2_noun]).strip().upper()
-                mod_v = str(r[c2_mod]).strip().upper()
-                long_v = str(r[c2_long]).strip()
-                mc_v = str(r[c2_code]).strip()
-                st_txt2.text(f"Mengekstrak atribut {idx+1}/{tot2}: [{mc_v}] {noun_v} - {mod_v}...")
-
-                schema_df = df_ms[(df_ms["NOUN"] == noun_v) & (df_ms["MODIFIER"] == mod_v)].sort_values("SEQ")
-                if not schema_df.empty:
-                    ext = extract_attributes(long_v, noun_v, mod_v, schema_df)
-                    attr_map = {a.seq: a.value for a in ext.attributes}
-                    full_attrs = [
-                        {
-                            "seq": int(sr["SEQ"]),
-                            "mandatory": sr["MANDATORY"],
-                            "attribute": sr["ATTRIBUTE"],
-                            "value": attr_map.get(int(sr["SEQ"]), ""),
-                        }
-                        for _, sr in schema_df.iterrows()
-                    ]
-                    std_long = ext.long_description
-                else:
-                    full_attrs = []
-                    std_long = long_v
-
-                extracted_list.append({
-                    "psc_code": default_psc,
-                    "psc_material_code": mc_v,
-                    "ref_no": str(r[c2_ref]).strip(),
-                    "noun": noun_v,
-                    "modifier": mod_v,
-                    "uom": str(r[c2_uom]).strip().upper() or "EA",
-                    "long_description": std_long,
-                    "attributes": full_attrs,
-                })
-                prog2.progress((idx + 1) / tot2)
-                time.sleep(0.2)
-
-            st.session_state.file2_items = extracted_list
-            st_txt2.success("Ekstraksi atribut Tahap 2 selesai!")
-
-    if st.session_state.file2_items:
-        for i, item in enumerate(st.session_state.file2_items):
-            df_attr = pd.DataFrame(item["attributes"])
-            if df_attr.empty:
-                st.warning(f"{i+1}. [{item['psc_material_code']}] Skema {item['noun']} - {item['modifier']} tidak ditemukan di master.")
-                continue
-            missing_m = df_attr[(df_attr["mandatory"] == "M") & (df_attr["value"].astype(str).str.strip() == "")]
-            status_label = f"⚠️ {len(missing_m)} Atribut Mandatory (M) Kosong" if len(missing_m) > 0 else "✅ Lengkap"
-
-            with st.expander(f"{i+1}. [{item['psc_material_code']}] {item['noun']} - {item['modifier']} | {status_label}", expanded=(len(missing_m) > 0)):
-                item["long_description"] = st.text_area("Material - Long Description (Baku)", item["long_description"], key=f"f2_ld_{i}")
-                edited_df = st.data_editor(
-                    df_attr,
-                    use_container_width=True,
-                    disabled=["seq", "mandatory", "attribute"],
-                    key=f"f2_ed_{i}",
-                )
-                item["attributes"] = edited_df.to_dict(orient="records")
-
-        buf_f2 = build_file2_buffer(st.session_state.file2_items, df_ms)
-        st.download_button(
-            label="Download File 2 Siap Upload e-Catalog SKK Migas (Data_Extraction_Upload.xlsx)",
-            data=buf_f2,
-            file_name="Data_Extraction_Upload.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+            for start_idx in range(0, total, batch_size):
+                end_idx = min(start_idx + batch_size, total)
+                status_txt.text(f"Memproses batch baris {start_idx+1} s/d {end
